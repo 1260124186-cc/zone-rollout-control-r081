@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"time"
 
 	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/platform"
@@ -43,29 +42,48 @@ func (s *Service) Submit(
 	}
 	fingerprint := domain.ProbeFingerprint(leaseID, input)
 	var result domain.Probe
-	var transition domain.LeaseTransition
-	replay := domain.Probe{}
-	hasReplay := false
+	replay := false
+	// Fast path: an already reported lease replays the stored probe (or
+	// rejects a conflicting payload) without rewriting the snapshot.
 	err := s.store.Read(ctx, func(state *domain.State) error {
 		lease, ok := state.Leases[leaseID]
 		if !ok {
 			return domain.NotFound("lease", leaseID)
 		}
+		if lease.State != domain.LeaseReported || lease.ProbeID == "" {
+			return nil
+		}
+		existing, err := replayableProbe(state, lease, leaseID, input.RequestKey, fingerprint)
+		if err != nil {
+			return err
+		}
+		result = existing
+		replay = true
+		return nil
+	})
+	if err != nil {
+		return domain.Probe{}, err
+	}
+	if replay {
+		return result, nil
+	}
+	// Re-validate and store inside a single write transaction so a
+	// concurrent release on the same lease is either persisted first (and
+	// this submission fails without leaving a probe behind) or sees the
+	// reported state (and fails itself); the two outcomes can never both
+	// be applied.
+	err = s.store.Write(ctx, func(state *domain.State) error {
+		lease, ok := state.Leases[leaseID]
+		if !ok {
+			return domain.NotFound("lease", leaseID)
+		}
 		if lease.State == domain.LeaseReported && lease.ProbeID != "" {
-			existing, found := state.Probes[lease.ProbeID]
-			if !found {
-				return domain.NewError(domain.CodeStorageFailure, "lease references a missing probe", map[string]any{
-					"probe_id": lease.ProbeID,
-				})
+			// A concurrent submission was confirmed first; replay it.
+			existing, err := replayableProbe(state, lease, leaseID, input.RequestKey, fingerprint)
+			if err != nil {
+				return err
 			}
-			if existing.PayloadFingerprint != fingerprint {
-				return domain.NewError(domain.CodeIdempotencyConflict, "request key was reused with different probe content", map[string]any{
-					"lease_id":    leaseID,
-					"request_key": input.RequestKey,
-				})
-			}
-			replay = existing
-			hasReplay = true
+			result = existing
 			return nil
 		}
 		if lease.State != domain.LeaseClaimed {
@@ -92,38 +110,32 @@ func (s *Service) Submit(
 				"node_id": lease.NodeID,
 			})
 		}
-		transition = domain.NewLeaseTransition(
+		transition := domain.NewLeaseTransition(
 			domain.LeaseTransitionProbe,
 			lease,
 			node,
 			now,
 		)
-		return transition.Validate(now)
-	})
-	if err != nil {
-		return domain.Probe{}, err
-	}
-	if hasReplay {
-		return replay, nil
-	}
-	result = domain.Probe{
-		ID:                 s.ids.New("prb"),
-		LeaseID:            transition.Lease.ID,
-		PlanID:             transition.Lease.PlanID,
-		NodeID:             transition.Lease.NodeID,
-		RequestKey:         input.RequestKey,
-		Success:            input.Success,
-		ObservedSerial:     input.ObservedSerial,
-		LatencyMS:          input.LatencyMS,
-		ObservedAt:         input.ObservedAt.UTC(),
-		StoredAt:           now,
-		PayloadFingerprint: fingerprint,
-	}
-	err = s.store.Write(ctx, func(state *domain.State) error {
-		lease, node := transition.ApplyProbe(result.ID)
+		if err := transition.Validate(now); err != nil {
+			return err
+		}
+		result = domain.Probe{
+			ID:                 s.ids.New("prb"),
+			LeaseID:            transition.Lease.ID,
+			PlanID:             transition.Lease.PlanID,
+			NodeID:             transition.Lease.NodeID,
+			RequestKey:         input.RequestKey,
+			Success:            input.Success,
+			ObservedSerial:     input.ObservedSerial,
+			LatencyMS:          input.LatencyMS,
+			ObservedAt:         input.ObservedAt.UTC(),
+			StoredAt:           now,
+			PayloadFingerprint: fingerprint,
+		}
+		updatedLease, updatedNode := transition.ApplyProbe(result.ID)
 		state.Probes[result.ID] = result
-		state.Leases[leaseID] = lease
-		state.Nodes[node.ID] = node
+		state.Leases[leaseID] = updatedLease
+		state.Nodes[updatedNode.ID] = updatedNode
 		store.AddAudit(state, s.ids, "probe", result.ID, "stored", now, map[string]any{
 			"lease_id": leaseID,
 			"plan_id":  transition.Lease.PlanID,
@@ -133,6 +145,24 @@ func (s *Service) Submit(
 	return result, err
 }
 
-func pointer(value time.Time) *time.Time {
-	return &value
+func replayableProbe(
+	state *domain.State,
+	lease domain.NodeLease,
+	leaseID string,
+	requestKey string,
+	fingerprint string,
+) (domain.Probe, error) {
+	existing, found := state.Probes[lease.ProbeID]
+	if !found {
+		return domain.Probe{}, domain.NewError(domain.CodeStorageFailure, "lease references a missing probe", map[string]any{
+			"probe_id": lease.ProbeID,
+		})
+	}
+	if existing.PayloadFingerprint != fingerprint {
+		return domain.Probe{}, domain.NewError(domain.CodeIdempotencyConflict, "request key was reused with different probe content", map[string]any{
+			"lease_id":    leaseID,
+			"request_key": requestKey,
+		})
+	}
+	return existing, nil
 }

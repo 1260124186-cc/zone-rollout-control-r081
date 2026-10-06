@@ -132,8 +132,9 @@ func (s *Service) Allocate(
 func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease, error) {
 	now := s.clock.Now().UTC()
 	var result domain.NodeLease
-	var transition domain.LeaseTransition
 	replay := false
+	// Fast path: a lease that already reached a terminal state replays its
+	// recorded outcome without rewriting the snapshot.
 	err := s.store.Read(ctx, func(state *domain.State) error {
 		lease, ok := state.Leases[leaseID]
 		if !ok {
@@ -142,6 +143,27 @@ func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease
 		if lease.State == domain.LeaseReleased || lease.State == domain.LeaseExpired {
 			result = lease
 			replay = true
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.NodeLease{}, err
+	}
+	if replay {
+		return result, nil
+	}
+	// Re-check and apply inside a single write transaction so a concurrent
+	// probe submission on the same lease is either persisted first (and this
+	// release fails) or sees the released state (and fails itself); the two
+	// outcomes can never both be applied.
+	err = s.store.Write(ctx, func(state *domain.State) error {
+		lease, ok := state.Leases[leaseID]
+		if !ok {
+			return domain.NotFound("lease", leaseID)
+		}
+		if lease.State == domain.LeaseReleased || lease.State == domain.LeaseExpired {
+			// A concurrent release or expiry was confirmed first; replay it.
+			result = lease
 			return nil
 		}
 		if lease.State != domain.LeaseClaimed {
@@ -156,21 +178,15 @@ func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease
 				"node_id": lease.NodeID,
 			})
 		}
-		transition = domain.NewLeaseTransition(
+		transition := domain.NewLeaseTransition(
 			domain.LeaseTransitionRelease,
 			lease,
 			node,
 			now,
 		)
-		return transition.Validate(now)
-	})
-	if err != nil {
-		return domain.NodeLease{}, err
-	}
-	if replay {
-		return result, nil
-	}
-	err = s.store.Write(ctx, func(state *domain.State) error {
+		if err := transition.Validate(now); err != nil {
+			return err
+		}
 		release, node := transition.ApplyRelease()
 		state.Leases[leaseID] = release
 		state.Nodes[node.ID] = node
