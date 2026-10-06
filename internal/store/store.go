@@ -76,6 +76,11 @@ func (s *Store) Snapshot(ctx context.Context) (domain.State, error) {
 	return snapshot, err
 }
 
+// ErrNoChange is returned from a Write callback when it determined that the
+// request is an idempotent replay. The transaction is discarded without
+// touching the revision or persisting a snapshot, and Write reports success.
+var ErrNoChange = errors.New("store: transaction made no changes")
+
 func (s *Store) Write(ctx context.Context, fn func(*domain.State) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -92,6 +97,9 @@ func (s *Store) Write(ctx context.Context, fn func(*domain.State) error) error {
 		})
 	}
 	if err := fn(&next); err != nil {
+		if errors.Is(err, ErrNoChange) {
+			return nil
+		}
 		return err
 	}
 	next.SchemaVersion = schemaVersion

@@ -132,17 +132,18 @@ func (s *Service) Allocate(
 func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease, error) {
 	now := s.clock.Now().UTC()
 	var result domain.NodeLease
-	var transition domain.LeaseTransition
-	replay := false
-	err := s.store.Read(ctx, func(state *domain.State) error {
+	err := s.store.Write(ctx, func(state *domain.State) error {
 		lease, ok := state.Leases[leaseID]
 		if !ok {
 			return domain.NotFound("lease", leaseID)
 		}
+		// Releasing a lease that already reached a terminal state is an
+		// idempotent replay: report the recorded outcome without any write.
+		// This is re-checked inside the write lock so a lease that was
+		// completed by a probe submission racing ahead is never moved back.
 		if lease.State == domain.LeaseReleased || lease.State == domain.LeaseExpired {
 			result = lease
-			replay = true
-			return nil
+			return store.ErrNoChange
 		}
 		if lease.State != domain.LeaseClaimed {
 			return domain.InvalidState("only a claimed lease can be released", map[string]any{
@@ -156,24 +157,18 @@ func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease
 				"node_id": lease.NodeID,
 			})
 		}
-		transition = domain.NewLeaseTransition(
+		transition := domain.NewLeaseTransition(
 			domain.LeaseTransitionRelease,
 			lease,
 			node,
 			now,
 		)
-		return transition.Validate(now)
-	})
-	if err != nil {
-		return domain.NodeLease{}, err
-	}
-	if replay {
-		return result, nil
-	}
-	err = s.store.Write(ctx, func(state *domain.State) error {
-		release, node := transition.ApplyRelease()
+		if err := transition.Validate(now); err != nil {
+			return err
+		}
+		release, releasedNode := transition.ApplyRelease()
 		state.Leases[leaseID] = release
-		state.Nodes[node.ID] = node
+		state.Nodes[releasedNode.ID] = releasedNode
 		store.AddAudit(state, s.ids, "lease", leaseID, "released", now, nil)
 		result = release
 		return nil

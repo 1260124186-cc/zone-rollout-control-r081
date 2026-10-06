@@ -38,19 +38,22 @@ func (s *Service) Submit(
 	if err := domain.ValidateProbeInput(input, now); err != nil {
 		return domain.Probe{}, err
 	}
+	// Expire due leases before acquiring the write lock. The decisive lease
+	// state is re-checked inside the transaction, so this cannot cause a race.
 	if _, err := s.expirer.ExpireDue(ctx); err != nil {
 		return domain.Probe{}, err
 	}
 	fingerprint := domain.ProbeFingerprint(leaseID, input)
 	var result domain.Probe
-	var transition domain.LeaseTransition
-	replay := domain.Probe{}
-	hasReplay := false
-	err := s.store.Read(ctx, func(state *domain.State) error {
+	err := s.store.Write(ctx, func(state *domain.State) error {
 		lease, ok := state.Leases[leaseID]
 		if !ok {
 			return domain.NotFound("lease", leaseID)
 		}
+		// A lease already bound to a probe is an idempotent replay: return the
+		// recorded probe without any write. The decision is made against the
+		// current state under the write lock, so a lease that a concurrent
+		// release committed first is never reported over.
 		if lease.State == domain.LeaseReported && lease.ProbeID != "" {
 			existing, found := state.Probes[lease.ProbeID]
 			if !found {
@@ -64,9 +67,8 @@ func (s *Service) Submit(
 					"request_key": input.RequestKey,
 				})
 			}
-			replay = existing
-			hasReplay = true
-			return nil
+			result = existing
+			return store.ErrNoChange
 		}
 		if lease.State != domain.LeaseClaimed {
 			return domain.NewError(domain.CodeLeaseNotClaimed, "lease is not claimed", map[string]any{
@@ -92,42 +94,37 @@ func (s *Service) Submit(
 				"node_id": lease.NodeID,
 			})
 		}
-		transition = domain.NewLeaseTransition(
+		transition := domain.NewLeaseTransition(
 			domain.LeaseTransitionProbe,
 			lease,
 			node,
 			now,
 		)
-		return transition.Validate(now)
-	})
-	if err != nil {
-		return domain.Probe{}, err
-	}
-	if hasReplay {
-		return replay, nil
-	}
-	result = domain.Probe{
-		ID:                 s.ids.New("prb"),
-		LeaseID:            transition.Lease.ID,
-		PlanID:             transition.Lease.PlanID,
-		NodeID:             transition.Lease.NodeID,
-		RequestKey:         input.RequestKey,
-		Success:            input.Success,
-		ObservedSerial:     input.ObservedSerial,
-		LatencyMS:          input.LatencyMS,
-		ObservedAt:         input.ObservedAt.UTC(),
-		StoredAt:           now,
-		PayloadFingerprint: fingerprint,
-	}
-	err = s.store.Write(ctx, func(state *domain.State) error {
-		lease, node := transition.ApplyProbe(result.ID)
-		state.Probes[result.ID] = result
-		state.Leases[leaseID] = lease
-		state.Nodes[node.ID] = node
-		store.AddAudit(state, s.ids, "probe", result.ID, "stored", now, map[string]any{
+		if err := transition.Validate(now); err != nil {
+			return err
+		}
+		probe := domain.Probe{
+			ID:                 s.ids.New("prb"),
+			LeaseID:            transition.Lease.ID,
+			PlanID:             transition.Lease.PlanID,
+			NodeID:             transition.Lease.NodeID,
+			RequestKey:         input.RequestKey,
+			Success:            input.Success,
+			ObservedSerial:     input.ObservedSerial,
+			LatencyMS:          input.LatencyMS,
+			ObservedAt:         input.ObservedAt.UTC(),
+			StoredAt:           now,
+			PayloadFingerprint: fingerprint,
+		}
+		reportedLease, reportedNode := transition.ApplyProbe(probe.ID)
+		state.Probes[probe.ID] = probe
+		state.Leases[leaseID] = reportedLease
+		state.Nodes[reportedNode.ID] = reportedNode
+		store.AddAudit(state, s.ids, "probe", probe.ID, "stored", now, map[string]any{
 			"lease_id": leaseID,
 			"plan_id":  transition.Lease.PlanID,
 		})
+		result = probe
 		return nil
 	})
 	return result, err
